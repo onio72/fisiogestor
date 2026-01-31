@@ -1,6 +1,27 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
+import {
+  addDoc,
+  collection,
+  doc,
+  getDocs,
+  limit,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+  updateDoc,
+  where,
+  writeBatch,
+} from "firebase/firestore";
+import { signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
+import * as XLSX from "xlsx";
+import { auth, db, provider } from "./firebase";
 
-// --- ICONOS SVG NATIVOS (Para evitar errores de librerías externas) ---
+const ADMIN_EMAILS = ["antoniogg@iesmajuelo.com", "agongar897s@g.educaand.es"];
+const JUSTIFICANTE_EMAIL = "antoniogg@iesmajuelo.com";
+const DAYS_AVAILABLE = 23;
+
+// --- ICONOS SVG NATIVOS ---
 const Icons = {
   Calendar: () => (
     <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -65,23 +86,7 @@ const Icons = {
       <line x1="5" y1="12" x2="19" y2="12"></line>
     </svg>
   ),
-  Download: () => (
-    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-      <polyline points="7 10 12 15 17 10"></polyline>
-      <line x1="12" y1="15" x2="12" y2="3"></line>
-    </svg>
-  ),
 };
-
-// --- MOCK DATA & CONFIG ---
-
-const USERS = [
-  { id: "u1", name: "Laura Garcia", role: "physio", department: "Rehabilitacion", daysAvailable: 23, daysUsed: 5 },
-  { id: "u2", name: "Carlos Ruiz", role: "physio", department: "Traumatologia", daysAvailable: 23, daysUsed: 12 },
-  { id: "u3", name: "Ana M. Lopez", role: "physio", department: "Respiratoria", daysAvailable: 23, daysUsed: 0 },
-  { id: "admin", name: "Director Gestion", role: "admin", department: "Administracion" },
-];
 
 const REQUEST_TYPES = [
   { id: "vacation", label: "Vacaciones", color: "bg-blue-100 text-blue-800" },
@@ -90,23 +95,13 @@ const REQUEST_TYPES = [
   { id: "training", label: "Formacion", color: "bg-green-100 text-green-800" },
 ];
 
-const INITIAL_REQUESTS = [
-  { id: 1, userId: "u1", userName: "Laura Garcia", type: "vacation", startDate: "2023-11-10", endDate: "2023-11-15", status: "approved", notes: "Vacaciones anuales", hasFile: false },
-  { id: 2, userId: "u2", userName: "Carlos Ruiz", type: "medical", startDate: "2023-11-20", endDate: "2023-11-22", status: "pending", notes: "Gripe fuerte", hasFile: true },
-  { id: 3, userId: "u3", userName: "Ana M. Lopez", type: "training", startDate: "2023-12-01", endDate: "2023-12-02", status: "rejected", notes: "Curso especializacion", hasFile: true },
-];
-
-// --- DATE HELPERS (robustos) ---
-
 const pad2 = (n) => String(n).padStart(2, "0");
 
 function parseISODate(iso) {
-  // Espera "YYYY-MM-DD". Devuelve Date a medianoche local.
   if (!iso || typeof iso !== "string") return null;
   const [y, m, d] = iso.split("-").map((v) => Number(v));
   if (!y || !m || !d) return null;
   const dt = new Date(y, m - 1, d);
-  // Validacion extra: el Date puede auto-corregir valores invalidos
   if (dt.getFullYear() !== y || dt.getMonth() !== m - 1 || dt.getDate() !== d) return null;
   return dt;
 }
@@ -115,13 +110,11 @@ function isInRange(dayDate, startISO, endISO) {
   const start = parseISODate(startISO);
   const end = parseISODate(endISO);
   if (!dayDate || !start || !end) return false;
-  // Normaliza: dia en [start, end]
   const t = dayDate.getTime();
   return t >= start.getTime() && t <= end.getTime();
 }
 
 function daysInMonth(year, monthIndex0) {
-  // monthIndex0: 0..11
   return new Date(year, monthIndex0 + 1, 0).getDate();
 }
 
@@ -130,12 +123,27 @@ function monthNameEs(monthIndex0) {
   return names[monthIndex0] ?? "";
 }
 
-// Convierte Date -> "YYYY-MM-DD"
 function toISODate(d) {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 }
 
-// --- UI HELPERS ---
+function countDaysInclusive(startISO, endISO) {
+  const start = parseISODate(startISO);
+  const end = parseISODate(endISO);
+  if (!start || !end) return 0;
+  const diffMs = end.getTime() - start.getTime();
+  return diffMs >= 0 ? Math.floor(diffMs / 86400000) + 1 : 0;
+}
+
+function formatTimestamp(ts) {
+  if (!ts) return "";
+  const d = ts.toDate ? ts.toDate() : new Date(ts);
+  return d.toLocaleString();
+}
+
+function normalizeHeader(value) {
+  return String(value || "").trim().toLowerCase();
+}
 
 const getStatusBadge = (status) => {
   switch (status) {
@@ -165,26 +173,24 @@ const getTypeLabel = (typeId) => {
   return type ? <span className={`px-2 py-1 rounded text-xs font-medium ${type.color}`}>{type.label}</span> : typeId;
 };
 
-// --- COMPONENTS ---
-
 const Sidebar = ({ activeTab, setActiveTab, user, onLogout }) => (
   <div className="w-64 bg-slate-900 text-white h-screen fixed left-0 top-0 flex flex-col shadow-xl z-50">
     <div className="p-6 border-b border-slate-700">
       <h1 className="text-xl font-bold flex items-center gap-2">
         <div className="w-8 h-8 bg-blue-500 rounded-lg flex items-center justify-center font-bold text-white">F</div>
-        FisioGestion
+        FisioGestor
       </h1>
       <p className="text-xs text-slate-400 mt-1">Control de Ausencias</p>
     </div>
 
     <nav className="flex-1 p-4 space-y-2">
-      {user?.role === "admin" ? (
+      {user?.isAdmin && (
         <>
           <button
             onClick={() => setActiveTab("dashboard")}
             className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === "dashboard" ? "bg-blue-600 text-white" : "text-slate-300 hover:bg-slate-800"}`}
           >
-            <Icons.PieChart /> Dashboard
+            <Icons.PieChart /> Resumen
           </button>
           <button
             onClick={() => setActiveTab("requests")}
@@ -196,10 +202,23 @@ const Sidebar = ({ activeTab, setActiveTab, user, onLogout }) => (
             onClick={() => setActiveTab("calendar")}
             className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === "calendar" ? "bg-blue-600 text-white" : "text-slate-300 hover:bg-slate-800"}`}
           >
-            <Icons.Calendar /> Calendario Global
+            <Icons.Calendar /> Calendario
+          </button>
+          <button
+            onClick={() => setActiveTab("rooms")}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === "rooms" ? "bg-blue-600 text-white" : "text-slate-300 hover:bg-slate-800"}`}
+          >
+            <Icons.Users /> Salas
+          </button>
+          <button
+            onClick={() => setActiveTab("physios")}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${activeTab === "physios" ? "bg-blue-600 text-white" : "text-slate-300 hover:bg-slate-800"}`}
+          >
+            <Icons.Users /> Fisioterapeutas
           </button>
         </>
-      ) : (
+      )}
+      {user?.isPhysio && (
         <>
           <button
             onClick={() => setActiveTab("my-requests")}
@@ -224,7 +243,9 @@ const Sidebar = ({ activeTab, setActiveTab, user, onLogout }) => (
         </div>
         <div>
           <p className="text-sm font-medium">{user?.name ?? "Usuario"}</p>
-          <p className="text-xs text-slate-400 capitalize">{user?.role === "admin" ? "Administrador" : "Fisioterapeuta"}</p>
+          <p className="text-xs text-slate-400 capitalize">
+            {user?.isAdmin && user?.isPhysio ? "Administrador / Fisioterapeuta" : user?.isAdmin ? "Administrador" : "Fisioterapeuta"}
+          </p>
         </div>
       </div>
       <button
@@ -237,14 +258,14 @@ const Sidebar = ({ activeTab, setActiveTab, user, onLogout }) => (
   </div>
 );
 
-const AdminDashboard = ({ requests, users, onGoRequests }) => {
+const AdminDashboard = ({ requests, physios }) => {
   const pendingCount = requests.filter((r) => r.status === "pending").length;
   const approvedCount = requests.filter((r) => r.status === "approved").length;
-  const activeUsers = users.filter((u) => u.role === "physio").length;
+  const activeUsers = physios.filter((p) => p.active).length;
 
   return (
     <div className="space-y-6">
-      <h2 className="text-2xl font-bold text-slate-800">Panel de Control</h2>
+      <h2 className="text-2xl font-bold text-slate-800">Resumen</h2>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
         <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
@@ -283,119 +304,194 @@ const AdminDashboard = ({ requests, users, onGoRequests }) => {
           </div>
         </div>
       </div>
-
-      <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-        <div className="p-6 border-b border-slate-100 flex justify-between items-center">
-          <h3 className="font-bold text-lg text-slate-800">Ultimas Solicitudes</h3>
-          <button onClick={onGoRequests} className="text-sm text-blue-600 font-medium hover:underline">
-            Ver todas
-          </button>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-sm">
-            <thead className="bg-slate-50 text-slate-500">
-              <tr>
-                <th className="px-6 py-4 font-medium">Empleado</th>
-                <th className="px-6 py-4 font-medium">Tipo</th>
-                <th className="px-6 py-4 font-medium">Fechas</th>
-                <th className="px-6 py-4 font-medium">Estado</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100">
-              {requests.slice(0, 5).map((req) => (
-                <tr key={req.id} className="hover:bg-slate-50">
-                  <td className="px-6 py-4 font-medium text-slate-900">{req.userName}</td>
-                  <td className="px-6 py-4">{getTypeLabel(req.type)}</td>
-                  <td className="px-6 py-4 text-slate-600">
-                    {req.startDate} - {req.endDate}
-                  </td>
-                  <td className="px-6 py-4">{getStatusBadge(req.status)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
     </div>
   );
 };
 
-const RequestsManager = ({ requests, onUpdateStatus }) => {
-  const [filter, setFilter] = useState("all");
+const RequestsTable = ({ requests, rooms, physios, onUpdateStatus }) => {
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [roomFilter, setRoomFilter] = useState("all");
+  const [physioFilter, setPhysioFilter] = useState("all");
+  const [sortBy, setSortBy] = useState("createdAt");
+  const [sortDir, setSortDir] = useState("desc");
 
-  const filteredRequests = requests.filter((r) => {
-    if (filter === "all") return true;
-    return r.status === filter;
+  const roomOptions = rooms.map((r) => ({ id: r.id, name: r.name }));
+  const physioOptions = physios.map((p) => ({ id: p.email || p.id, name: p.displayName || p.email }));
+
+  const filtered = requests.filter((r) => {
+    if (statusFilter !== "all" && r.status !== statusFilter) return false;
+    if (roomFilter !== "all" && r.roomId !== roomFilter) return false;
+    if (physioFilter !== "all" && r.userEmail !== physioFilter) return false;
+    return true;
   });
 
+  const sorted = [...filtered].sort((a, b) => {
+    const dir = sortDir === "asc" ? 1 : -1;
+    const av = a[sortBy];
+    const bv = b[sortBy];
+
+    if (sortBy === "createdAt") {
+      const ad = av?.toDate ? av.toDate().getTime() : 0;
+      const bd = bv?.toDate ? bv.toDate().getTime() : 0;
+      return (ad - bd) * dir;
+    }
+
+    if (typeof av === "string" && typeof bv === "string") {
+      return av.localeCompare(bv) * dir;
+    }
+
+    return (av > bv ? 1 : av < bv ? -1 : 0) * dir;
+  });
+
+  const toggleSort = (field) => {
+    if (sortBy === field) {
+      setSortDir(sortDir === "asc" ? "desc" : "asc");
+      return;
+    }
+    setSortBy(field);
+    setSortDir("asc");
+  };
+
   return (
-    <div className="space-y-6">
-      <div className="flex flex-col md:flex-row justify-between md:items-center gap-4">
-        <h2 className="text-2xl font-bold text-slate-800">Gestion de Solicitudes</h2>
-        <div className="flex bg-slate-100 p-1 rounded-lg w-fit">
-          {["all", "pending", "approved", "rejected"].map((f) => (
-            <button
-              key={f}
-              onClick={() => setFilter(f)}
-              className={`px-4 py-2 rounded-md text-sm font-medium transition-all ${filter === f ? "bg-white text-slate-800 shadow-sm" : "text-slate-500 hover:text-slate-700"}`}
-            >
-              {f === "all" ? "Todas" : f === "pending" ? "Pendiente" : f === "approved" ? "Aprobado" : "Rechazado"}
-            </button>
-          ))}
+    <div className="space-y-4">
+      <div className="flex flex-wrap gap-3 items-center">
+        <div className="flex items-center gap-2">
+          <span className="text-sm text-slate-500">Estado</span>
+          <select className="border border-slate-200 rounded-lg px-3 py-2 text-sm" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+            <option value="all">Todos</option>
+            <option value="pending">Pendiente</option>
+            <option value="approved">Aprobado</option>
+            <option value="rejected">Rechazado</option>
+          </select>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-sm text-slate-500">Sala</span>
+          <select className="border border-slate-200 rounded-lg px-3 py-2 text-sm" value={roomFilter} onChange={(e) => setRoomFilter(e.target.value)}>
+            <option value="all">Todas</option>
+            {roomOptions.map((r) => (
+              <option key={r.id} value={r.id}>{r.name}</option>
+            ))}
+          </select>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-sm text-slate-500">Fisio</span>
+          <select className="border border-slate-200 rounded-lg px-3 py-2 text-sm" value={physioFilter} onChange={(e) => setPhysioFilter(e.target.value)}>
+            <option value="all">Todos</option>
+            {physioOptions.map((p) => (
+              <option key={p.id} value={p.id}>{p.name}</option>
+            ))}
+          </select>
         </div>
       </div>
 
-      <div className="grid gap-4">
-        {filteredRequests.length === 0 ? (
-          <div className="text-center py-12 bg-slate-50 rounded-xl border-2 border-dashed border-slate-200">
-            <p className="text-slate-400">No hay solicitudes en esta categoria.</p>
-          </div>
-        ) : (
-          filteredRequests.map((req) => (
-            <div key={req.id} className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex flex-col md:flex-row justify-between gap-4">
-              <div className="flex-1 space-y-2">
-                <div className="flex items-center gap-3 flex-wrap">
-                  <span className="font-bold text-lg text-slate-800">{req.userName}</span>
-                  {getTypeLabel(req.type)}
-                  {getStatusBadge(req.status)}
-                </div>
-                <div className="text-slate-500 text-sm flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-6">
-                  <span className="flex items-center gap-1">
-                    <Icons.Calendar /> {req.startDate} a {req.endDate}
-                  </span>
-                  {req.hasFile && (
-                    <span
-                      className="flex items-center gap-1 text-blue-600 cursor-pointer hover:underline"
-                      onClick={() => alert("Demo: aqui abririas/descargarias el justificante.")}
-                      role="button"
-                      tabIndex={0}
-                    >
-                      <Icons.FileText /> Ver Justificante
-                    </span>
-                  )}
-                </div>
-                {req.notes && <p className="text-sm text-slate-600 bg-slate-50 p-3 rounded-lg mt-2">"{req.notes}"</p>}
-              </div>
+      <div className="flex gap-4 text-sm text-slate-500 flex-wrap">
+        <span className="flex items-center gap-1">
+          <div className="w-3 h-3 rounded-full bg-blue-500"></div> Vacaciones
+        </span>
+        <span className="flex items-center gap-1">
+          <div className="w-3 h-3 rounded-full bg-red-500"></div> Baja
+        </span>
+        <span className="flex items-center gap-1">
+          <div className="w-3 h-3 rounded-full bg-green-500"></div> Formacion
+        </span>
+        <span className="flex items-center gap-1">
+          <div className="w-3 h-3 rounded-full bg-purple-500"></div> Asuntos propios
+        </span>
+      </div>
 
-              {req.status === "pending" && (
-                <div className="flex items-center gap-2 border-t md:border-t-0 md:border-l border-slate-100 pt-4 md:pt-0 md:pl-4">
-                  <button
-                    onClick={() => onUpdateStatus(req.id, "approved")}
-                    className="flex-1 md:flex-none px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg text-sm font-medium transition-colors"
-                  >
-                    Aprobar
-                  </button>
-                  <button
-                    onClick={() => onUpdateStatus(req.id, "rejected")}
-                    className="flex-1 md:flex-none px-4 py-2 bg-red-100 hover:bg-red-200 text-red-700 rounded-lg text-sm font-medium transition-colors"
-                  >
-                    Rechazar
-                  </button>
-                </div>
-              )}
-            </div>
-          ))
-        )}
+      <div className="flex gap-4 text-sm text-slate-500 flex-wrap">
+        <span className="flex items-center gap-1">
+          <div className="w-3 h-3 rounded-full bg-blue-500"></div> Vacaciones
+        </span>
+        <span className="flex items-center gap-1">
+          <div className="w-3 h-3 rounded-full bg-red-500"></div> Baja
+        </span>
+        <span className="flex items-center gap-1">
+          <div className="w-3 h-3 rounded-full bg-green-500"></div> Formacion
+        </span>
+        <span className="flex items-center gap-1">
+          <div className="w-3 h-3 rounded-full bg-purple-500"></div> Asuntos propios
+        </span>
+      </div>
+
+      <div className="flex gap-4 text-sm text-slate-500 flex-wrap">
+        <span className="flex items-center gap-1">
+          <div className="w-3 h-3 rounded-full bg-blue-500"></div> Vacaciones
+        </span>
+        <span className="flex items-center gap-1">
+          <div className="w-3 h-3 rounded-full bg-red-500"></div> Baja
+        </span>
+        <span className="flex items-center gap-1">
+          <div className="w-3 h-3 rounded-full bg-green-500"></div> Formacion
+        </span>
+        <span className="flex items-center gap-1">
+          <div className="w-3 h-3 rounded-full bg-purple-500"></div> Asuntos propios
+        </span>
+      </div>
+
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+        <table className="w-full text-left text-sm">
+          <thead className="bg-slate-50 text-slate-500">
+            <tr>
+              {[
+                { key: "userName", label: "Empleado" },
+                { key: "roomName", label: "Sala" },
+                { key: "type", label: "Tipo" },
+                { key: "startDate", label: "Inicio" },
+                { key: "endDate", label: "Fin" },
+                { key: "status", label: "Estado" },
+                { key: "createdAt", label: "Solicitud" },
+              ].map((h) => (
+                <th
+                  key={h.key}
+                  className="px-4 py-3 font-medium cursor-pointer select-none"
+                  onClick={() => toggleSort(h.key)}
+                >
+                  {h.label} {sortBy === h.key ? (sortDir === "asc" ? "↑" : "↓") : ""}
+                </th>
+              ))}
+              <th className="px-4 py-3 font-medium">Acciones</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {sorted.map((req) => (
+              <tr key={req.id} className="hover:bg-slate-50">
+                <td className="px-4 py-3 font-medium text-slate-900">{req.userName}</td>
+                <td className="px-4 py-3 text-slate-600">{req.roomName || "-"}</td>
+                <td className="px-4 py-3">{getTypeLabel(req.type)}</td>
+                <td className="px-4 py-3 text-slate-600">{req.startDate}</td>
+                <td className="px-4 py-3 text-slate-600">{req.endDate}</td>
+                <td className="px-4 py-3">{getStatusBadge(req.status)}</td>
+                <td className="px-4 py-3 text-slate-600">{formatTimestamp(req.createdAt)}</td>
+                <td className="px-4 py-3">
+                  {req.status === "pending" && (
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => onUpdateStatus(req.id, "approved")}
+                        className="px-3 py-1 bg-green-600 hover:bg-green-700 text-white rounded-lg text-xs font-medium"
+                      >
+                        Aprobar
+                      </button>
+                      <button
+                        onClick={() => onUpdateStatus(req.id, "rejected")}
+                        className="px-3 py-1 bg-red-100 hover:bg-red-200 text-red-700 rounded-lg text-xs font-medium"
+                      >
+                        Rechazar
+                      </button>
+                    </div>
+                  )}
+                </td>
+              </tr>
+            ))}
+            {sorted.length === 0 && (
+              <tr>
+                <td colSpan={8} className="px-6 py-8 text-center text-slate-400">
+                  No hay solicitudes con esos filtros.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
       </div>
     </div>
   );
@@ -407,13 +503,14 @@ const NewRequestForm = ({ user, onSubmit, onCancel }) => {
     startDate: "",
     endDate: "",
     notes: "",
-    file: null,
+    declaredSent: false,
   });
   const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
 
   const medicalNeedsFile = formData.type === "medical";
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
     setError("");
 
@@ -428,21 +525,27 @@ const NewRequestForm = ({ user, onSubmit, onCancel }) => {
       setError("La fecha fin no puede ser anterior a la fecha inicio.");
       return;
     }
-    if (medicalNeedsFile && !formData.file) {
-      setError("Para baja medica es obligatorio adjuntar justificante.");
+    if (medicalNeedsFile && !formData.declaredSent) {
+      setError("Para baja medica debes confirmar el envio del justificante.");
       return;
     }
 
-    onSubmit({
-      type: formData.type,
-      startDate: formData.startDate,
-      endDate: formData.endDate,
-      notes: formData.notes,
-      // En app real: subir a servidor y guardar URL. Aqui solo indicamos si hay archivo:
-      hasFile: Boolean(formData.file),
-      userId: user.id,
-      userName: user.name,
-    });
+    setSubmitting(true);
+    try {
+      await onSubmit({
+        type: formData.type,
+        startDate: formData.startDate,
+        endDate: formData.endDate,
+        notes: formData.notes,
+        declaredSent: formData.declaredSent,
+        userId: user.id,
+        userName: user.name,
+      });
+    } catch (err) {
+      setError(err?.message || "No se pudo enviar la solicitud.");
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -509,28 +612,27 @@ const NewRequestForm = ({ user, onSubmit, onCancel }) => {
 
         <div>
           <label className="block text-sm font-medium text-slate-700 mb-2">
-            Justificante (PDF/Imagen)
-            <span className="ml-2 text-xs text-slate-400 font-normal">{medicalNeedsFile ? "Obligatorio para bajas medicas" : "Opcional"}</span>
+            Justificante
+            <span className="ml-2 text-xs text-slate-400 font-normal">{medicalNeedsFile ? "Obligatorio" : "Opcional"}</span>
           </label>
-
-          {/* IMPORTANTE: relative para que el label absolute funcione si lo usas. Aqui lo hacemos mas simple: label envolviendo */}
-          <label className="relative border-2 border-dashed border-slate-200 rounded-lg p-6 flex flex-col items-center justify-center text-slate-500 hover:bg-slate-50 transition-colors cursor-pointer">
-            <Icons.FileText />
-            <p className="text-sm mt-2">Haz clic para adjuntar archivo</p>
-
-            <input
-              type="file"
-              className="hidden"
-              accept="application/pdf,image/*"
-              onChange={(e) => setFormData({ ...formData, file: e.target.files?.[0] ?? null })}
-            />
-
-            {formData.file && (
-              <div className="mt-4 px-4 py-2 bg-blue-50 text-blue-700 rounded-full text-xs font-medium flex items-center gap-2">
-                <Icons.CheckCircle /> {formData.file.name}
-              </div>
-            )}
-          </label>
+          <div className="border border-slate-200 rounded-lg p-4 bg-slate-50 text-sm text-slate-600 space-y-2">
+            <p>
+              El solicitante comunica haber remitido el justificante al correo
+              <span className="font-semibold"> {JUSTIFICANTE_EMAIL}</span>.
+            </p>
+            <p className="text-xs text-slate-500">
+              Si no se envia en el mismo dia, la solicitud sera desestimada.
+            </p>
+            <label className="flex items-center gap-2 pt-2">
+              <input
+                type="checkbox"
+                className="h-4 w-4 rounded border-slate-300"
+                checked={formData.declaredSent}
+                onChange={(e) => setFormData({ ...formData, declaredSent: e.target.checked })}
+              />
+              <span>Confirmo que he remitido el justificante por email.</span>
+            </label>
+          </div>
         </div>
 
         <div className="pt-4 border-t border-slate-100 flex items-center justify-end gap-3">
@@ -538,11 +640,12 @@ const NewRequestForm = ({ user, onSubmit, onCancel }) => {
             type="button"
             onClick={onCancel}
             className="px-6 py-2 text-slate-600 font-medium hover:bg-slate-100 rounded-lg transition-colors"
+            disabled={submitting}
           >
             Cancelar
           </button>
-          <button type="submit" className="px-6 py-2 bg-blue-600 text-white font-bold rounded-lg hover:bg-blue-700 transition-colors shadow-lg shadow-blue-200">
-            Enviar Solicitud
+          <button type="submit" className="px-6 py-2 bg-blue-600 text-white font-bold rounded-lg hover:bg-blue-700 transition-colors shadow-lg shadow-blue-200" disabled={submitting}>
+            {submitting ? "Enviando..." : "Enviar Solicitud"}
           </button>
         </div>
       </form>
@@ -552,6 +655,9 @@ const NewRequestForm = ({ user, onSubmit, onCancel }) => {
 
 const UserRequests = ({ requests, user }) => {
   const myRequests = requests.filter((r) => r.userId === user.id);
+  const approvedDays = myRequests
+    .filter((r) => r.status === "approved")
+    .reduce((acc, r) => acc + countDaysInclusive(r.startDate, r.endDate), 0);
 
   return (
     <div className="space-y-6">
@@ -562,15 +668,15 @@ const UserRequests = ({ requests, user }) => {
         <div className="flex gap-8 flex-wrap">
           <div>
             <p className="text-sm opacity-75 mb-1">Dias Totales</p>
-            <p className="text-3xl font-bold">{user.daysAvailable}</p>
+            <p className="text-3xl font-bold">{DAYS_AVAILABLE}</p>
           </div>
           <div>
             <p className="text-sm opacity-75 mb-1">Disfrutados</p>
-            <p className="text-3xl font-bold">{user.daysUsed}</p>
+            <p className="text-3xl font-bold">{approvedDays}</p>
           </div>
           <div>
             <p className="text-sm opacity-75 mb-1">Pendientes</p>
-            <p className="text-3xl font-bold">{user.daysAvailable - user.daysUsed}</p>
+            <p className="text-3xl font-bold">{Math.max(DAYS_AVAILABLE - approvedDays, 0)}</p>
           </div>
         </div>
       </div>
@@ -584,7 +690,7 @@ const UserRequests = ({ requests, user }) => {
               <th className="px-6 py-4 font-medium">Tipo</th>
               <th className="px-6 py-4 font-medium">Fechas</th>
               <th className="px-6 py-4 font-medium">Estado</th>
-              <th className="px-6 py-4 font-medium text-right">Acciones</th>
+              <th className="px-6 py-4 font-medium">Solicitud</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
@@ -595,17 +701,7 @@ const UserRequests = ({ requests, user }) => {
                   {req.startDate} - {req.endDate}
                 </td>
                 <td className="px-6 py-4">{getStatusBadge(req.status)}</td>
-                <td className="px-6 py-4 text-right">
-                  {req.status === "approved" && (
-                    <button
-                      className="text-slate-400 hover:text-slate-600"
-                      onClick={() => alert("Demo: aqui exportarias/descargarias el documento.")}
-                      title="Descargar"
-                    >
-                      <Icons.Download />
-                    </button>
-                  )}
-                </td>
+                <td className="px-6 py-4 text-slate-600">{formatTimestamp(req.createdAt)}</td>
               </tr>
             ))}
             {myRequests.length === 0 && (
@@ -622,34 +718,38 @@ const UserRequests = ({ requests, user }) => {
   );
 };
 
-const CalendarView = ({ requests }) => {
-  // Mes seleccionado (por defecto: Nov 2023 para que "case" con tus datos iniciales)
-  const [cursor, setCursor] = useState(() => new Date(2023, 10, 1)); // 10 = noviembre
+const CalendarView = ({ requests, rooms, physios }) => {
+  const [cursor, setCursor] = useState(() => new Date());
+  const [statusFilter, setStatusFilter] = useState("approved");
+  const [roomFilter, setRoomFilter] = useState("all");
+  const [physioFilter, setPhysioFilter] = useState("all");
 
   const year = cursor.getFullYear();
   const monthIndex0 = cursor.getMonth();
   const dim = daysInMonth(year, monthIndex0);
 
-  // Lunes=0 ... Domingo=6 (ajuste europeo)
   const firstDay = new Date(year, monthIndex0, 1);
-  const firstWeekdayJs = firstDay.getDay(); // 0 domingo .. 6 sabado
-  const firstWeekdayMon0 = (firstWeekdayJs + 6) % 7; // convierte a lunes=0
+  const firstWeekdayJs = firstDay.getDay();
+  const firstWeekdayMon0 = (firstWeekdayJs + 6) % 7;
 
-  const approvedRequests = useMemo(() => requests.filter((r) => r.status === "approved"), [requests]);
+  const filteredRequests = requests.filter((r) => {
+    if (statusFilter !== "all" && r.status !== statusFilter) return false;
+    if (roomFilter !== "all" && r.roomId !== roomFilter) return false;
+    if (physioFilter !== "all" && r.userEmail !== physioFilter) return false;
+    return true;
+  });
 
   const gridCells = useMemo(() => {
     const cells = [];
-    // huecos iniciales
     for (let i = 0; i < firstWeekdayMon0; i++) cells.push(null);
     for (let d = 1; d <= dim; d++) cells.push(new Date(year, monthIndex0, d));
-    // relleno final hasta multiplo de 7
     while (cells.length % 7 !== 0) cells.push(null);
     return cells;
   }, [year, monthIndex0, dim, firstWeekdayMon0]);
 
   const getRequestsForDate = (dateObj) => {
     if (!dateObj) return [];
-    return approvedRequests.filter((r) => isInRange(dateObj, r.startDate, r.endDate));
+    return filteredRequests.filter((r) => isInRange(dateObj, r.startDate, r.endDate));
   };
 
   const goPrevMonth = () => setCursor((d) => new Date(d.getFullYear(), d.getMonth() - 1, 1));
@@ -664,9 +764,9 @@ const CalendarView = ({ requests }) => {
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
         <div>
           <h2 className="text-2xl font-bold text-slate-800">
-            Calendario Global - {monthNameEs(monthIndex0)} {year}
+            Calendario - {monthNameEs(monthIndex0)} {year}
           </h2>
-          <p className="text-sm text-slate-500">Se muestran solo ausencias aprobadas.</p>
+          <p className="text-sm text-slate-500">Filtra por estado, sala o fisioterapeuta.</p>
         </div>
 
         <div className="flex items-center gap-2">
@@ -682,19 +782,34 @@ const CalendarView = ({ requests }) => {
         </div>
       </div>
 
-      <div className="flex gap-4 text-sm text-slate-500 flex-wrap">
-        <span className="flex items-center gap-1">
-          <div className="w-3 h-3 rounded-full bg-blue-500"></div> Vacaciones
-        </span>
-        <span className="flex items-center gap-1">
-          <div className="w-3 h-3 rounded-full bg-red-500"></div> Baja
-        </span>
-        <span className="flex items-center gap-1">
-          <div className="w-3 h-3 rounded-full bg-green-500"></div> Formacion
-        </span>
-        <span className="flex items-center gap-1">
-          <div className="w-3 h-3 rounded-full bg-purple-500"></div> Asuntos propios
-        </span>
+      <div className="flex flex-wrap gap-3 items-center">
+        <div className="flex items-center gap-2">
+          <span className="text-sm text-slate-500">Estado</span>
+          <select className="border border-slate-200 rounded-lg px-3 py-2 text-sm" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+            <option value="all">Todos</option>
+            <option value="pending">Pendiente</option>
+            <option value="approved">Aprobado</option>
+            <option value="rejected">Rechazado</option>
+          </select>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-sm text-slate-500">Sala</span>
+          <select className="border border-slate-200 rounded-lg px-3 py-2 text-sm" value={roomFilter} onChange={(e) => setRoomFilter(e.target.value)}>
+            <option value="all">Todas</option>
+            {rooms.map((r) => (
+              <option key={r.id} value={r.id}>{r.name}</option>
+            ))}
+          </select>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-sm text-slate-500">Fisio</span>
+          <select className="border border-slate-200 rounded-lg px-3 py-2 text-sm" value={physioFilter} onChange={(e) => setPhysioFilter(e.target.value)}>
+            <option value="all">Todos</option>
+            {physios.map((p) => (
+              <option key={p.id} value={p.email || p.id}>{p.displayName || p.email}</option>
+            ))}
+          </select>
+        </div>
       </div>
 
       <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
@@ -712,7 +827,6 @@ const CalendarView = ({ requests }) => {
 
             const day = dateObj.getDate();
             const dayRequests = getRequestsForDate(dateObj);
-
             const visible = dayRequests.slice(0, 2);
             const extra = dayRequests.length - visible.length;
 
@@ -728,7 +842,7 @@ const CalendarView = ({ requests }) => {
                       }`}
                       title={`${r.userName} (${r.type})`}
                     >
-                      {r.userName.split(" ")[0]}
+                      {r.userName?.split(" ")[0] ?? ""}
                     </div>
                   ))}
                   {extra > 0 && <div className="text-[10px] text-center text-slate-400">+ {extra} mas</div>}
@@ -742,65 +856,487 @@ const CalendarView = ({ requests }) => {
   );
 };
 
-// --- MAIN APP COMPONENT ---
+const RoomsManager = ({ rooms, onCreateRoom }) => {
+  const [name, setName] = useState("");
+  const [error, setError] = useState("");
 
-export default function App() {
-  const [currentUser, setCurrentUser] = useState(null); // null = login screen
-  const [activeTab, setActiveTab] = useState("dashboard");
-  const [requests, setRequests] = useState(INITIAL_REQUESTS);
-
-  const physios = useMemo(() => USERS.filter((u) => u.role === "physio"), []);
-  const adminUser = useMemo(() => USERS.find((u) => u.role === "admin") ?? null, []);
-
-  const handleLogin = (role, physioId = null) => {
-    if (role === "admin") {
-      if (!adminUser) {
-        alert("No existe usuario admin en USERS.");
-        return;
-      }
-      setCurrentUser(adminUser);
-      setActiveTab("dashboard");
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError("");
+    const trimmed = name.trim();
+    if (!trimmed) {
+      setError("Debes indicar el nombre de la sala.");
       return;
     }
-
-    // Physio: si no se pasa id, usa el primero disponible
-    const chosen = physios.find((p) => p.id === physioId) ?? physios[0] ?? null;
-    if (!chosen) {
-      alert("No existen usuarios fisioterapeutas en USERS.");
-      return;
+    try {
+      await onCreateRoom(trimmed);
+      setName("");
+    } catch (err) {
+      setError("No se pudo crear la sala.");
     }
-    setCurrentUser(chosen);
-    setActiveTab("my-requests");
   };
 
-  const handleCreateRequest = (newReq) => {
-    const request = {
-      id: Date.now(),
+  return (
+    <div className="space-y-6">
+      <h2 className="text-2xl font-bold text-slate-800">Salas</h2>
+
+      <form onSubmit={handleSubmit} className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 space-y-4 max-w-xl">
+        {error && <div className="text-sm text-red-600">{error}</div>}
+        <div>
+          <label className="block text-sm font-medium text-slate-700 mb-2">Nueva sala</label>
+          <input
+            className="w-full px-4 py-2 border border-slate-200 rounded-lg"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Ej. Sala Tomares"
+          />
+        </div>
+        <button className="px-4 py-2 bg-blue-600 text-white rounded-lg">Crear sala</button>
+      </form>
+
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden max-w-xl">
+        <table className="w-full text-left text-sm">
+          <thead className="bg-slate-50 text-slate-500">
+            <tr>
+              <th className="px-6 py-4 font-medium">Sala</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {rooms.map((r) => (
+              <tr key={r.id}>
+                <td className="px-6 py-4 text-slate-700">{r.name}</td>
+              </tr>
+            ))}
+            {rooms.length === 0 && (
+              <tr>
+                <td className="px-6 py-8 text-center text-slate-400">No hay salas creadas.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
+const PhysiosManager = ({ rooms, physios, onUpsertPhysio, onImportExcel, onToggleActive }) => {
+  const [formData, setFormData] = useState({
+    firstName: "",
+    lastName: "",
+    email: "",
+    roomId: "",
+  });
+  const [error, setError] = useState("");
+  const [importing, setImporting] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError("");
+    if (!formData.email.trim() || !formData.firstName.trim() || !formData.lastName.trim() || !formData.roomId) {
+      setError("Completa nombre, apellidos, email y sala.");
+      return;
+    }
+    try {
+      await onUpsertPhysio(formData);
+      setFormData({ firstName: "", lastName: "", email: "", roomId: "" });
+    } catch (err) {
+      setError("No se pudo guardar el fisioterapeuta.");
+    }
+  };
+
+  const handleImport = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImporting(true);
+    setError("");
+    try {
+      await onImportExcel(file);
+    } catch (err) {
+      setError("No se pudo importar el Excel.");
+    } finally {
+      setImporting(false);
+      e.target.value = "";
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <h2 className="text-2xl font-bold text-slate-800">Fisioterapeutas</h2>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <form onSubmit={handleSubmit} className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 space-y-4">
+          {error && <div className="text-sm text-red-600">{error}</div>}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-2">Nombre</label>
+              <input
+                className="w-full px-4 py-2 border border-slate-200 rounded-lg"
+                value={formData.firstName}
+                onChange={(e) => setFormData({ ...formData, firstName: e.target.value })}
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-2">Apellidos</label>
+              <input
+                className="w-full px-4 py-2 border border-slate-200 rounded-lg"
+                value={formData.lastName}
+                onChange={(e) => setFormData({ ...formData, lastName: e.target.value })}
+              />
+            </div>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-2">Email</label>
+            <input
+              type="email"
+              className="w-full px-4 py-2 border border-slate-200 rounded-lg"
+              value={formData.email}
+              onChange={(e) => setFormData({ ...formData, email: e.target.value })}
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-2">Sala</label>
+            <select
+              className="w-full px-4 py-2 border border-slate-200 rounded-lg"
+              value={formData.roomId}
+              onChange={(e) => setFormData({ ...formData, roomId: e.target.value })}
+            >
+              <option value="">Selecciona sala</option>
+              {rooms.map((r) => (
+                <option key={r.id} value={r.id}>{r.name}</option>
+              ))}
+            </select>
+          </div>
+          <button className="px-4 py-2 bg-blue-600 text-white rounded-lg">Guardar</button>
+        </form>
+
+        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 space-y-4">
+          <h3 className="font-bold text-slate-800">Importar Excel</h3>
+          <p className="text-sm text-slate-600">
+            Columnas esperadas: nombre, apellidos, email, sala.
+          </p>
+          <input type="file" accept=".xlsx,.xls" onChange={handleImport} disabled={importing} />
+          {importing && <p className="text-sm text-slate-500">Importando...</p>}
+        </div>
+      </div>
+
+      <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+        <table className="w-full text-left text-sm">
+          <thead className="bg-slate-50 text-slate-500">
+            <tr>
+              <th className="px-4 py-3 font-medium">Nombre</th>
+              <th className="px-4 py-3 font-medium">Email</th>
+              <th className="px-4 py-3 font-medium">Sala</th>
+              <th className="px-4 py-3 font-medium">Estado</th>
+              <th className="px-4 py-3 font-medium">Acciones</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {physios.map((p) => (
+              <tr key={p.id}>
+                <td className="px-4 py-3 text-slate-700">{p.displayName || "-"}</td>
+                <td className="px-4 py-3 text-slate-600">{p.email}</td>
+                <td className="px-4 py-3 text-slate-600">{p.roomName || "-"}</td>
+                <td className="px-4 py-3">{p.active ? "Activo" : "Baja"}</td>
+                <td className="px-4 py-3">
+                  <button
+                    onClick={() => onToggleActive(p)}
+                    className={`px-3 py-1 rounded-lg text-xs font-medium ${p.active ? "bg-red-100 text-red-700" : "bg-green-100 text-green-700"}`}
+                  >
+                    {p.active ? "Dar de baja" : "Reactivar"}
+                  </button>
+                </td>
+              </tr>
+            ))}
+            {physios.length === 0 && (
+              <tr>
+                <td colSpan={5} className="px-6 py-8 text-center text-slate-400">No hay fisios registrados.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
+export default function App() {
+  const [currentUser, setCurrentUser] = useState(null);
+  const [activeTab, setActiveTab] = useState("dashboard");
+  const [requests, setRequests] = useState([]);
+  const [rooms, setRooms] = useState([]);
+  const [physios, setPhysios] = useState([]);
+  const [authError, setAuthError] = useState("");
+  const [authChecking, setAuthChecking] = useState(true);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, async (user) => {
+      setAuthChecking(true);
+      if (!user) {
+        setCurrentUser(null);
+        setRequests([]);
+        setActiveTab("dashboard");
+        setAuthChecking(false);
+        return;
+      }
+
+      const email = user.email || "";
+      const isAdmin = ADMIN_EMAILS.includes(email);
+
+      const physioQuery = query(
+        collection(db, "physios"),
+        where("email", "==", email),
+        limit(1)
+      );
+      const snap = await getDocs(physioQuery);
+      const physioDoc = snap.empty ? null : snap.docs[0];
+      const physio = physioDoc ? { id: physioDoc.id, ...physioDoc.data() } : null;
+
+      if (physio && physio.active === false) {
+        if (isAdmin) {
+          setCurrentUser({
+            id: user.uid,
+            email,
+            name: user.displayName || email || "Administrador",
+            isAdmin: true,
+            isPhysio: false,
+            roomId: "",
+            roomName: "",
+          });
+          setActiveTab("dashboard");
+        } else {
+          setCurrentUser({
+            id: user.uid,
+            email,
+            name: physio.displayName || user.displayName || email || "Usuario",
+            role: "blocked",
+            reason: "Tu cuenta esta dada de baja.",
+          });
+        }
+        setAuthChecking(false);
+        return;
+      }
+
+      if (!isAdmin && !physio) {
+        setCurrentUser({
+          id: user.uid,
+          email,
+          name: user.displayName || email || "Usuario",
+          role: "blocked",
+          reason: "No estas autorizado en el sistema.",
+        });
+        setAuthChecking(false);
+        return;
+      }
+
+      setCurrentUser({
+        id: user.uid,
+        email,
+        name: physio?.displayName || user.displayName || email || (isAdmin ? "Administrador" : "Usuario"),
+        isAdmin,
+        isPhysio: Boolean(physio),
+        roomId: physio?.roomId || "",
+        roomName: physio?.roomName || "",
+      });
+      setActiveTab(isAdmin ? "dashboard" : "my-requests");
+      setAuthChecking(false);
+    });
+
+    return () => unsub();
+  }, []);
+
+  useEffect(() => {
+    if (!currentUser || currentUser.role === "blocked") return;
+
+    const roomsQuery = query(collection(db, "rooms"), orderBy("name", "asc"));
+    const unsubRooms = onSnapshot(roomsQuery, (snap) => {
+      setRooms(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    });
+
+    const physiosQuery = query(collection(db, "physios"), orderBy("displayName", "asc"));
+    const unsubPhysios = onSnapshot(physiosQuery, (snap) => {
+      setPhysios(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    });
+
+    return () => {
+      unsubRooms();
+      unsubPhysios();
+    };
+  }, [currentUser]);
+
+  useEffect(() => {
+    if (!currentUser || currentUser.role === "blocked") return;
+
+    const base = collection(db, "requests");
+    const q = currentUser.isAdmin
+      ? query(base, orderBy("createdAt", "desc"))
+      : query(base, where("userId", "==", currentUser.id), orderBy("createdAt", "desc"));
+
+    const unsub = onSnapshot(q, (snap) => {
+      const data = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      setRequests(data);
+    });
+
+    return () => unsub();
+  }, [currentUser]);
+
+  const handleLogin = async () => {
+    setAuthError("");
+    try {
+      await signInWithPopup(auth, provider);
+    } catch (err) {
+      setAuthError(err?.message || "No se pudo iniciar sesion.");
+    }
+  };
+
+  const handleLogout = async () => {
+    await signOut(auth);
+  };
+
+  const handleCreateRequest = async (newReq) => {
+    if (!currentUser) return;
+
+    await addDoc(collection(db, "requests"), {
       status: "pending",
-      hasFile: Boolean(newReq.hasFile),
+      declaredSent: Boolean(newReq.declaredSent),
       userId: newReq.userId,
+      userEmail: currentUser.email || "",
       userName: newReq.userName,
+      roomId: currentUser.roomId || "",
+      roomName: currentUser.roomName || "",
       type: newReq.type,
       startDate: newReq.startDate,
       endDate: newReq.endDate,
       notes: newReq.notes,
-    };
+      createdAt: serverTimestamp(),
+    });
 
-    // IMPORTANTE: updater function para no perder estado
-    setRequests((prev) => [request, ...prev]);
     setActiveTab("my-requests");
   };
 
-  const handleUpdateStatus = (id, newStatus) => {
-    setRequests((prev) => prev.map((r) => (r.id === id ? { ...r, status: newStatus } : r)));
+  const handleUpdateStatus = async (id, newStatus) => {
+    await updateDoc(doc(db, "requests", id), { status: newStatus });
   };
 
-  const handleLogout = () => {
-    setCurrentUser(null);
-    setActiveTab("dashboard");
+  const handleCreateRoom = async (name) => {
+    await addDoc(collection(db, "rooms"), {
+      name,
+      createdAt: serverTimestamp(),
+    });
   };
 
-  // Login Screen
+  const handleUpsertPhysio = async (data) => {
+    const room = rooms.find((r) => r.id === data.roomId);
+    const email = data.email.trim().toLowerCase();
+    const displayName = `${data.firstName.trim()} ${data.lastName.trim()}`.trim();
+    const existing = physios.find((p) => p.email?.toLowerCase() === email);
+
+    if (existing) {
+      await updateDoc(doc(db, "physios", existing.id), {
+        firstName: data.firstName.trim(),
+        lastName: data.lastName.trim(),
+        displayName,
+        email,
+        roomId: room?.id || "",
+        roomName: room?.name || "",
+        active: true,
+        updatedAt: serverTimestamp(),
+      });
+      return;
+    }
+
+    await addDoc(collection(db, "physios"), {
+      firstName: data.firstName.trim(),
+      lastName: data.lastName.trim(),
+      displayName,
+      email,
+      roomId: room?.id || "",
+      roomName: room?.name || "",
+      active: true,
+      createdAt: serverTimestamp(),
+    });
+  };
+
+  const handleToggleActive = async (physio) => {
+    await updateDoc(doc(db, "physios", physio.id), {
+      active: !physio.active,
+      updatedAt: serverTimestamp(),
+    });
+  };
+
+  const handleImportExcel = async (file) => {
+    const buffer = await file.arrayBuffer();
+    const workbook = XLSX.read(buffer, { type: "array" });
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+
+    const roomByName = new Map(rooms.map((r) => [r.name.toLowerCase(), r]));
+    const physioByEmail = new Map(physios.map((p) => [String(p.email || "").toLowerCase(), p]));
+
+    const batch = writeBatch(db);
+    const newRooms = new Map();
+
+    for (const row of rows) {
+      const mapped = {};
+      Object.keys(row).forEach((key) => {
+        const normalized = normalizeHeader(key);
+        mapped[normalized] = row[key];
+      });
+
+      const firstName = String(mapped.nombre || "").trim();
+      const lastName = String(mapped.apellidos || "").trim();
+      const email = String(mapped.email || "").trim().toLowerCase();
+      const roomName = String(mapped.sala || "").trim();
+
+      if (!email || !roomName) continue;
+
+      let room = roomByName.get(roomName.toLowerCase()) || newRooms.get(roomName.toLowerCase());
+      if (!room) {
+        const ref = doc(collection(db, "rooms"));
+        const payload = { name: roomName, createdAt: serverTimestamp() };
+        batch.set(ref, payload);
+        room = { id: ref.id, name: roomName };
+        newRooms.set(roomName.toLowerCase(), room);
+      }
+
+      const displayName = `${firstName} ${lastName}`.trim();
+      const existing = physioByEmail.get(email);
+      if (existing) {
+        batch.update(doc(db, "physios", existing.id), {
+          firstName,
+          lastName,
+          displayName,
+          email,
+          roomId: room.id,
+          roomName: room.name,
+          active: true,
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        const ref = doc(collection(db, "physios"));
+        batch.set(ref, {
+          firstName,
+          lastName,
+          displayName,
+          email,
+          roomId: room.id,
+          roomName: room.name,
+          active: true,
+          createdAt: serverTimestamp(),
+        });
+      }
+    }
+
+    await batch.commit();
+  };
+
+  if (authChecking) {
+    return (
+      <div className="min-h-screen bg-slate-100 flex items-center justify-center text-slate-500">
+        Cargando...
+      </div>
+    );
+  }
+
   if (!currentUser) {
     return (
       <div className="min-h-screen bg-slate-100 flex items-center justify-center p-4 font-sans">
@@ -808,66 +1344,88 @@ export default function App() {
           <div className="w-16 h-16 bg-blue-600 rounded-xl flex items-center justify-center mx-auto mb-6 shadow-lg shadow-blue-200">
             <span className="text-3xl font-bold text-white">F</span>
           </div>
-          <h1 className="text-2xl font-bold text-slate-800 mb-2">Bienvenido a FisioGestion</h1>
-          <p className="text-slate-500 mb-8">Selecciona un perfil para probar la demo</p>
+          <h1 className="text-2xl font-bold text-slate-800 mb-2">Bienvenido a FisioGestor</h1>
+          <p className="text-slate-500 mb-8">Inicia sesion con Google para continuar</p>
 
-          <div className="space-y-4">
-            {/* Seleccion de fisio (opcional) */}
-            <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 text-left">
-              <p className="text-xs font-semibold text-slate-500 mb-3">Entrar como fisioterapeuta</p>
-              <div className="space-y-2">
-                {physios.map((p) => (
-                  <button
-                    key={p.id}
-                    onClick={() => handleLogin("physio", p.id)}
-                    className="w-full p-4 border border-slate-200 rounded-xl hover:border-blue-500 hover:bg-blue-50 transition-all group flex items-center justify-between"
-                  >
-                    <div className="text-left">
-                      <p className="font-bold text-slate-800 group-hover:text-blue-700">{p.name}</p>
-                      <p className="text-xs text-slate-400">{p.department}</p>
-                    </div>
-                    <Icons.Users />
-                  </button>
-                ))}
-                {physios.length === 0 && <p className="text-sm text-slate-400">No hay usuarios physio en USERS.</p>}
-              </div>
+          {authError && (
+            <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg text-sm mb-4">
+              {authError}
             </div>
+          )}
 
-            <button
-              onClick={() => handleLogin("admin")}
-              className="w-full p-4 border border-slate-200 rounded-xl hover:border-purple-500 hover:bg-purple-50 transition-all group flex items-center justify-between"
-            >
-              <div className="text-left">
-                <p className="font-bold text-slate-800 group-hover:text-purple-700">Soy Gestor/Admin</p>
-                <p className="text-xs text-slate-400">Aprobar solicitudes, ver reportes...</p>
-              </div>
-              <Icons.PieChart />
-            </button>
-          </div>
+          <button
+            onClick={handleLogin}
+            className="w-full p-4 border border-slate-200 rounded-xl hover:border-blue-500 hover:bg-blue-50 transition-all group flex items-center justify-center gap-3"
+          >
+            <Icons.Users />
+            <span className="font-bold text-slate-800 group-hover:text-blue-700">Iniciar sesion con Google</span>
+          </button>
         </div>
       </div>
     );
   }
 
-  // Main Layout
+  if (currentUser.role === "blocked") {
+    return (
+      <div className="min-h-screen bg-slate-100 flex items-center justify-center p-4 font-sans">
+        <div className="bg-white p-8 rounded-2xl shadow-xl max-w-md w-full text-center">
+          <h1 className="text-2xl font-bold text-slate-800 mb-2">Acceso bloqueado</h1>
+          <p className="text-slate-500 mb-6">{currentUser.reason || "No autorizado."}</p>
+          <button
+            onClick={handleLogout}
+            className="w-full p-4 border border-slate-200 rounded-xl hover:border-blue-500 hover:bg-blue-50 transition-all"
+          >
+            Cerrar sesion
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-50 flex font-sans">
       <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} user={currentUser} onLogout={handleLogout} />
 
       <main className="flex-1 ml-64 p-8">
-        {currentUser.role === "admin" && activeTab === "dashboard" && (
-          <AdminDashboard requests={requests} users={USERS} onGoRequests={() => setActiveTab("requests")} />
+        {currentUser.isAdmin && !currentUser.isPhysio && (
+          <div className="mb-6 bg-yellow-50 border border-yellow-200 text-yellow-800 px-4 py-3 rounded-lg text-sm">
+            Para solicitar ausencias, crea tu ficha de fisioterapeuta en la seccion \"Fisioterapeutas\".
+          </div>
+        )}
+        {currentUser.isAdmin && activeTab === "dashboard" && (
+          <AdminDashboard requests={requests} physios={physios} />
         )}
 
-        {currentUser.role === "admin" && activeTab === "requests" && (
-          <RequestsManager requests={requests} onUpdateStatus={handleUpdateStatus} />
+        {currentUser.isAdmin && activeTab === "requests" && (
+          <RequestsTable requests={requests} rooms={rooms} physios={physios} onUpdateStatus={handleUpdateStatus} />
         )}
 
-        {currentUser.role === "admin" && activeTab === "calendar" && <CalendarView requests={requests} />}
+        {currentUser.isAdmin && activeTab === "calendar" && (
+          <CalendarView requests={requests} rooms={rooms} physios={physios} />
+        )}
 
-        {currentUser.role === "physio" && activeTab === "my-requests" && <UserRequests requests={requests} user={currentUser} />}
+        {currentUser.isAdmin && activeTab === "rooms" && (
+          <RoomsManager rooms={rooms} onCreateRoom={handleCreateRoom} />
+        )}
 
-        {currentUser.role === "physio" && activeTab === "new-request" && (
+        {currentUser.isAdmin && activeTab === "physios" && (
+          <PhysiosManager
+            rooms={rooms}
+            physios={physios}
+            onUpsertPhysio={handleUpsertPhysio}
+            onImportExcel={handleImportExcel}
+            onToggleActive={handleToggleActive}
+          />
+        )}
+
+        {currentUser.isPhysio && activeTab === "my-requests" && (
+          <UserRequests
+            requests={currentUser.isAdmin ? requests.filter((r) => r.userEmail === currentUser.email) : requests}
+            user={currentUser}
+          />
+        )}
+
+        {currentUser.isPhysio && activeTab === "new-request" && (
           <NewRequestForm
             user={currentUser}
             onSubmit={handleCreateRequest}
